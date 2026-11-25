@@ -1,3 +1,5 @@
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from './config.js';
+
 const el = (id) => document.getElementById(id);
 const login = el('login-form');
 const reservation = el('reservation-form');
@@ -7,7 +9,7 @@ const resetForm = el('reset-form');
 const dateFormat = new Intl.DateTimeFormat('ar-SA-u-ca-gregory', {
   timeZone: 'Asia/Riyadh', dateStyle: 'medium', timeStyle: 'short',
 });
-let token = sessionStorage.getItem('amr-session');
+let session = JSON.parse(sessionStorage.getItem('amr-session') ?? 'null');
 let user;
 let offset = 0;
 let query = '';
@@ -21,51 +23,69 @@ function notice(message, error = false) {
   element.classList.toggle('error', error);
 }
 
-function setSession(nextToken) {
-  token = nextToken;
-  if (token) sessionStorage.setItem('amr-session', token);
+function setSession(next) {
+  session = next ? { access_token: next.access_token, refresh_token: next.refresh_token, expires_at: next.expires_at } : null;
+  if (session) sessionStorage.setItem('amr-session', JSON.stringify(session));
   else sessionStorage.removeItem('amr-session');
 }
 
-function showLogin() {
-  setSession(null);
-  user = undefined;
-  listRequest += 1;
-  el('logout').hidden = true;
-  el('workspace').hidden = true;
-  el('login-view').hidden = false;
-  el('admin-view').hidden = true;
-  el('admin-toggle').setAttribute('aria-expanded', 'false');
-  el('receipt').hidden = true;
-  el('letter-number').textContent = '';
-  el('letters').replaceChildren();
-  el('users').replaceChildren();
-  el('search-form').reset();
-  if (resetDialog.open) resetDialog.close();
-  reservation.reset();
-  users.reset();
+async function refreshSession() {
+  if (!session?.refresh_token) return false;
+  const { response, payload } = await request('/auth/v1/token?grant_type=refresh_token', {
+    data: { refresh_token: session.refresh_token },
+  });
+  if (!response.ok || !payload?.access_token) return false;
+  setSession(payload);
+  return true;
+}
+
+async function rpc(name, data = {}) {
+  const sent = session;
+  if (!sent) throw new Error('سجّل دخولك للمتابعة.');
+  if (sent.expires_at * 1000 - Date.now() < 60_000) await refreshSession();
+  let { response, payload } = await request(`/rest/v1/rpc/${name}`, { data, bearer: session?.access_token });
+  if (response.status === 401 && session === sent && await refreshSession()) {
+    ({ response, payload } = await request(`/rest/v1/rpc/${name}`, { data, bearer: session.access_token }));
+  }
+  if (response.status === 401 || payload?.details === '401') {
+    if (session) showLogin();
+    throw new Error('سجّل دخولك للمتابعة.');
+  }
+  if (!response.ok) {
+    throw new Error(payload?.code === 'P0001' && payload.message ? payload.message : 'تعذر إكمال العملية.');
+  }
+  return payload;
+}
+
+async function signIn({ email, password }) {
+  const { response, payload } = await request('/auth/v1/token?grant_type=password', {
+    data: { email: String(email).trim().toLowerCase(), password },
+  });
+  if (response.status === 400 || response.status === 401) throw new Error(authError);
+  if (response.status === 429) throw new Error('محاولات دخول كثيرة. حاول مرة أخرى بعد عدة دقائق.');
+  if (!response.ok || !payload?.access_token) throw new Error('تعذر إكمال العملية.');
+  setSession(payload);
 }
 
 async function api(path, { method = 'GET', data } = {}) {
-  const headers = {};
-  const sentToken = token;
-  if (sentToken) headers.Authorization = `Bearer ${sentToken}`;
-  if (data !== undefined) headers['Content-Type'] = 'application/json';
-  let response;
-  try {
-    response = await fetch(`/api${path}`, {
-      method,
-      headers,
-      body: data === undefined ? undefined : JSON.stringify(data),
-      signal: AbortSignal.timeout(20_000),
-    });
-  } catch {
-    throw new Error('تعذر الاتصال بالنظام. حاول مرة أخرى.');
+  const url = new URL(path, 'http://x');
+  const id = path.split('?')[0].split('/')[2];
+  if (path === '/me') return rpc('me');
+  if (path === '/login') return signIn(data);
+  if (path === '/logout') {
+    const current = session;
+    showLogin();
+    if (current) await request('/auth/v1/logout', { bearer: current.access_token }).catch(() => {});
+    return {};
   }
-  const payload = await response.json().catch(() => null);
-  if (response.status === 401 && sentToken && token === sentToken) showLogin();
-  if (!response.ok || !payload) throw new Error(payload?.error ?? 'تعذر إكمال العملية.');
-  return payload;
+  if (url.pathname === '/letters' && method === 'GET') {
+    return rpc('list_letters', { p_query: url.searchParams.get('q') ?? '', p_offset: Number(url.searchParams.get('offset')) || 0 });
+  }
+  if (url.pathname === '/letters') return rpc('reserve_letter', { p_subject: data.subject, p_request_id: data.requestId });
+  if (path === '/users' && method === 'GET') return rpc('list_employees');
+  if (path === '/users') return rpc('create_employee', { p_name: data.name, p_email: data.email, p_password: data.password });
+  if (Object.hasOwn(data, 'password')) return rpc('set_employee_password', { p_id: id, p_password: data.password });
+  return rpc('set_employee_active', { p_id: id, p_active: data.active });
 }
 
 async function submit(event, action, onError = (error) => notice(error.message, true)) {
@@ -138,9 +158,9 @@ function makeButton(label) {
 }
 
 async function loadUsers() {
-  const activeToken = token;
+  const active = session;
   const accounts = await api('/users');
-  if (activeToken !== token) return;
+  if (active !== session) return;
   const table = el('users');
   table.replaceChildren();
   if (!accounts.length) emptyRow(table, 'لا توجد حسابات موظفين بعد.');
@@ -186,9 +206,8 @@ async function showWorkspace() {
 }
 
 login.addEventListener('submit', (event) => submit(event, async (data) => {
-  const result = await api('/login', { method: 'POST', data });
+  await api('/login', { method: 'POST', data });
   login.reset();
-  setSession(result.token);
   await showWorkspace();
 }));
 
@@ -268,7 +287,7 @@ el('logout').addEventListener('click', async () => {
   }
 });
 
-if (!token) {
+if (!session) {
   showLogin();
 } else {
   showWorkspace().catch((error) => {
