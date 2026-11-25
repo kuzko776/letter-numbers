@@ -29,6 +29,46 @@ function setSession(next) {
   else sessionStorage.removeItem('amr-session');
 }
 
+const authError = 'البريد الإلكتروني أو كلمة المرور غير صحيحة.';
+
+async function request(path, { data, bearer } = {}) {
+  let response;
+  try {
+    response = await fetch(`${SUPABASE_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${bearer ?? SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify(data ?? {}),
+    });
+  } catch {
+    throw new Error('تعذر الاتصال بالخادم. تحقق من الإنترنت وحاول مرة أخرى.');
+  }
+  const payload = await response.json().catch(() => null);
+  return { response, payload };
+}
+
+function showLogin() {
+  setSession(null);
+  user = undefined;
+  listRequest += 1;
+  el('logout').hidden = true;
+  el('workspace').hidden = true;
+  el('login-view').hidden = false;
+  el('admin-view').hidden = true;
+  el('admin-toggle').setAttribute('aria-expanded', 'false');
+  el('receipt').hidden = true;
+  el('letter-number').textContent = '';
+  el('letters').replaceChildren();
+  el('users').replaceChildren();
+  el('search-form').reset();
+  if (resetDialog.open) resetDialog.close();
+  reservation.reset();
+  users.reset();
+}
+
 async function refreshSession() {
   if (!session?.refresh_token) return false;
   const { response, payload } = await request('/auth/v1/token?grant_type=refresh_token', {
